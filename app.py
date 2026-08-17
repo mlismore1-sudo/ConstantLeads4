@@ -1,0 +1,790 @@
+import base64
+import io
+import json
+import math
+import re
+import threading
+import time
+import wave
+from datetime import datetime, timezone
+from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import psycopg
+import requests
+import streamlit as st
+from psycopg.rows import dict_row
+from streamlit_autorefresh import st_autorefresh
+
+APP_VERSION = "2026-08-17-restricted-sic-rest-review"
+STREAM_URL = "https://stream.companieshouse.gov.uk/companies"
+DISPLAY_LIMIT = 250
+REFRESH_INTERVAL_MS = 15000
+
+TARGET_SIC_CODES = {
+    "62012", "63110", "64209", "64301", "64999", "72110"
+}
+TARGET_NAME_KEYWORDS = {
+    "labs", "global", "holdings", "capital", "ai", "technology",
+    "technologies", "uk", "london", "europe", "inc", "pty", "pvt", "group",
+}
+UK_TIMEZONE = ZoneInfo("Europe/London")
+
+
+def get_connection(database_url):
+    return psycopg.connect(
+        database_url,
+        row_factory=dict_row,
+        connect_timeout=30,
+        sslmode="require",
+    )
+
+
+def today_in_uk():
+    return datetime.now(UK_TIMEZONE).date().isoformat()
+
+
+def name_matches_target_keywords(company_name):
+    name = str(company_name or "").strip().lower()
+    return any(
+        re.search(rf"(?<![a-z]){re.escape(keyword)}(?![a-z])", name)
+        for keyword in TARGET_NAME_KEYWORDS
+    )
+
+
+@st.cache_data
+def create_chime():
+    sample_rate = 44100
+    duration = 0.35
+    volume = 0.25
+    frequencies = (880, 1175)
+    frames = bytearray()
+
+    for index in range(int(sample_rate * duration)):
+        current_time = index / sample_rate
+        frequency = frequencies[0] if current_time < 0.16 else frequencies[1]
+        attack = min(1.0, index / 800)
+        release = max(0.0, 1.0 - max(0.0, current_time - 0.20) / 0.15)
+        sample = int(
+            32767 * volume * attack * release
+            * math.sin(2 * math.pi * frequency * current_time)
+        )
+        frames.extend(sample.to_bytes(2, byteorder="little", signed=True))
+
+    audio_buffer = io.BytesIO()
+    with wave.open(audio_buffer, "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(sample_rate)
+        audio.writeframes(frames)
+    return audio_buffer.getvalue()
+
+
+def play_chime():
+    encoded_audio = base64.b64encode(create_chime()).decode("ascii")
+    st.markdown(
+        f'<audio autoplay><source src="data:audio/wav;base64,{encoded_audio}" '
+        'type="audio/wav"></audio>',
+        unsafe_allow_html=True,
+    )
+
+
+def dataframe_from_query(connection, query, params=()):
+    with connection.cursor() as cursor:
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        columns = [column.name for column in cursor.description]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def google_search_name(company_name):
+    search_name = str(company_name or "")
+    for suffix in (" Limited", " LIMITED", " Ltd", " LTD"):
+        search_name = search_name.replace(suffix, "")
+    return "https://www.google.com/search?q=" + quote_plus(
+        " ".join(search_name.split()).strip()
+    )
+
+
+def add_google_search_links(dataframe):
+    dataframe = dataframe.copy()
+    dataframe["Google search"] = dataframe["Company name"].map(
+        google_search_name
+    )
+    return dataframe
+
+
+def ensure_worker_status_table(connection):
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS public.worker_status ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1), "
+        "status TEXT NOT NULL, last_connected_at TIMESTAMPTZ, "
+        "last_event_at TIMESTAMPTZ, last_error TEXT, "
+        "updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+        ")"
+    )
+    connection.commit()
+
+
+def update_worker_status(connection, status, error=None, event_received=False):
+    connection.execute(
+        "INSERT INTO public.worker_status ("
+        "id, status, last_connected_at, last_event_at, last_error, updated_at"
+        ") VALUES (1, %s, "
+        "CASE WHEN %s = 'connected' THEN NOW() ELSE NULL END, "
+        "CASE WHEN %s THEN NOW() ELSE NULL END, %s, NOW()) "
+        "ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, "
+        "last_connected_at = CASE WHEN EXCLUDED.status = 'connected' "
+        "THEN NOW() ELSE public.worker_status.last_connected_at END, "
+        "last_event_at = CASE WHEN %s THEN NOW() "
+        "ELSE public.worker_status.last_event_at END, "
+        "last_error = EXCLUDED.last_error, updated_at = NOW()",
+        (status, status, event_received, error, event_received),
+    )
+
+
+def table_exists(connection, table_name):
+    row = connection.execute(
+        "SELECT to_regclass(%s) AS table_name",
+        (f"public.{table_name}",),
+    ).fetchone()
+    return row["table_name"] is not None
+
+
+def check_database_connection(database_url):
+    try:
+        with get_connection(database_url) as connection:
+            info = connection.execute(
+                "SELECT current_database() AS database_name, "
+                "current_schema() AS schema_name, NOW() AS database_time"
+            ).fetchone()
+            stream = None
+            worker = None
+            if table_exists(connection, "stream_state"):
+                stream = connection.execute(
+                    "SELECT timepoint, updated_at FROM public.stream_state WHERE id = 1"
+                ).fetchone()
+            if table_exists(connection, "worker_status"):
+                worker = connection.execute(
+                    "SELECT status, last_connected_at, last_event_at, "
+                    "last_error, updated_at FROM public.worker_status WHERE id = 1"
+                ).fetchone()
+        return True, info, stream, worker, None
+    except Exception as error:
+        return False, None, None, None, f"{type(error).__name__}: {error}"
+
+
+def get_timepoint(connection):
+    row = connection.execute(
+        "SELECT timepoint FROM public.stream_state WHERE id = 1"
+    ).fetchone()
+    return row["timepoint"] if row else None
+
+
+def extract_metadata(event):
+    metadata = event.get("event") or {}
+    return (
+        metadata.get("timepoint", event.get("timepoint")),
+        metadata.get("published_at", event.get("published_at")),
+    )
+
+
+def save_timepoint(connection, timepoint):
+    if timepoint is None:
+        return
+    connection.execute(
+        "INSERT INTO public.stream_state (id, timepoint, updated_at) "
+        "VALUES (1, %s, NOW()) ON CONFLICT (id) DO UPDATE SET "
+        "timepoint = EXCLUDED.timepoint, updated_at = NOW()",
+        (int(timepoint),),
+    )
+
+
+def call_rest_api_for_review(company, rest_api_url, rest_api_key):
+    """
+    Call your external REST API to check:
+      - if a company is an owner in the shareholder structure
+      - if any director lives in an EU country or USA
+    Return a dict:
+      {
+        "has_company_shareholder": bool,
+        "eu_director_countries": "DE,FR,...",
+        "us_director": bool,
+        "review_status": "approved" | "rejected",
+        "payload": {...raw JSON...}
+      }
+    Adjust this to your actual API contract.
+    """
+    if not rest_api_url or not rest_api_key:
+        # No API configured: default to approve
+        return {
+            "has_company_shareholder": False,
+            "eu_director_countries": "",
+            "us_director": False,
+            "review_status": "approved",
+            "payload": {"note": "No REST API configured"},
+        }
+
+    try:
+        resp = requests.post(
+            rest_api_url,
+            json={"company": company},
+            headers={"Authorization": f"Bearer {rest_api_key}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Adapt these mappings to your API's response schema
+        has_company_shareholder = bool(data.get("has_company_shareholder", False))
+        eu_director_countries = ",".join(
+            sorted(set(str(c).upper() for c in (data.get("eu_director_countries") or [])))
+        )
+        us_director = bool(data.get("us_director", False))
+
+        # Your business rule for approval; adjust as needed
+        is_risky = (
+            has_company_shareholder
+            or eu_director_countries
+            or us_director
+        )
+        review_status = "rejected" if is_risky else "approved"
+
+        return {
+            "has_company_shareholder": has_company_shareholder,
+            "eu_director_countries": eu_director_countries,
+            "us_director": us_director,
+            "review_status": review_status,
+            "payload": data,
+        }
+    except Exception:
+        # On error, default to pending (do not auto-approve)
+        return {
+            "has_company_shareholder": None,
+            "eu_director_countries": None,
+            "us_director": None,
+            "review_status": "pending",
+            "payload": {"error": "REST API call failed"},
+        }
+
+
+def save_matching_company(
+    connection,
+    company,
+    published_at,
+    received_at,
+    test_all_sic_codes,
+    restricted_sic_codes,
+    rest_api_url,
+    rest_api_key,
+):
+    company_number = company.get("company_number")
+    company_name = company.get("company_name") or "Unnamed company"
+    incorporation_date = company.get("date_of_creation")
+    sic_codes = {
+        str(code).strip() for code in (company.get("sic_codes") or [])
+    }
+
+    if not company_number:
+        return False
+
+    # Only save companies incorporated on the current UK calendar date.
+    if incorporation_date != today_in_uk():
+        return False
+
+    sic_matches_target = bool(sic_codes.intersection(TARGET_SIC_CODES))
+    sic_matches_restricted = bool(sic_codes.intersection(restricted_sic_codes))
+    name_matches = name_matches_target_keywords(company_name)
+
+    # Determine source_type and initial review_status
+    if sic_matches_target:
+        source_type = "target_sic"
+        review_status = "approved"
+    elif name_matches:
+        source_type = "buzzword"
+        review_status = "approved"
+    elif sic_matches_restricted:
+        source_type = "restricted_sic"
+        review_status = "pending"
+    else:
+        # Not a company we care about
+        if not test_all_sic_codes:
+            return False
+        # If test_all_sic_codes is True, treat as target_sic for debugging
+        source_type = "target_sic"
+        review_status = "approved"
+
+    company_url = (
+        "https://find-and-update.company-information.service.gov.uk/company/"
+        f"{company_number}"
+    )
+
+    # For restricted_sic, call REST API to determine review_status and enrichment
+    has_company_shareholder = None
+    eu_director_countries = None
+    us_director = None
+    rest_api_payload = None
+
+    if source_type == "restricted_sic":
+        review_result = call_rest_api_for_review(
+            company, rest_api_url, rest_api_key
+        )
+        review_status = review_result["review_status"]
+        has_company_shareholder = review_result["has_company_shareholder"]
+        eu_director_countries = review_result["eu_director_countries"]
+        us_director = review_result["us_director"]
+        rest_api_payload = review_result["payload"]
+
+    connection.execute(
+        "INSERT INTO public.screened_companies ("
+        "company_number, company_name, incorporation_date, company_status, "
+        "sic_codes, company_url, screened_at, shortlisted, published_at, received_at, "
+        "source_type, review_status, "
+        "has_company_shareholder, eu_director_countries, us_director, "
+        "rest_api_reviewed_at, rest_api_payload"
+        ") VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (company_number) DO UPDATE SET "
+        "company_name = EXCLUDED.company_name, "
+        "incorporation_date = EXCLUDED.incorporation_date, "
+        "company_status = EXCLUDED.company_status, "
+        "sic_codes = EXCLUDED.sic_codes, company_url = EXCLUDED.company_url, "
+        "published_at = COALESCE(EXCLUDED.published_at, "
+        "public.screened_companies.published_at), "
+        "received_at = EXCLUDED.received_at, "
+        "source_type = EXCLUDED.source_type, "
+        "review_status = EXCLUDED.review_status, "
+        "has_company_shareholder = EXCLUDED.has_company_shareholder, "
+        "eu_director_countries = EXCLUDED.eu_director_countries, "
+        "us_director = EXCLUDED.us_director, "
+        "rest_api_reviewed_at = COALESCE(EXCLUDED.rest_api_reviewed_at, "
+        "public.screened_companies.rest_api_reviewed_at), "
+        "rest_api_payload = COALESCE(EXCLUDED.rest_api_payload, "
+        "public.screened_companies.rest_api_payload)",
+        (
+            company_number,
+            company_name,
+            incorporation_date,
+            company.get("company_status", ""),
+            ", ".join(sorted(sic_codes)),
+            company_url,
+            received_at,
+            published_at,
+            received_at,
+            source_type,
+            review_status,
+            has_company_shareholder,
+            eu_director_countries,
+            us_director,
+            datetime.now(timezone.utc) if rest_api_payload else None,
+            json.dumps(rest_api_payload) if rest_api_payload else None,
+        ),
+    )
+    return True
+
+
+def stream_worker(database_url, api_key, test_all_sic_codes, restricted_sic_codes, rest_api_url, rest_api_key):
+    reconnect_delay = 5
+    status_interval_seconds = 30
+    last_status_update = 0.0
+    session = requests.Session()
+    session.auth = (api_key, "")
+    session.headers.update({"Accept": "application/json"})
+
+    print(
+        "Background worker starting. "
+        f"Mode={'ALL SIC' if test_all_sic_codes else 'SIC OR NAME'}. "
+        f"UK date={today_in_uk()}. "
+        f"Restricted SIC count={len(restricted_sic_codes)}",
+        flush=True,
+    )
+
+    while True:
+        connection = None
+        try:
+            connection = get_connection(database_url)
+            ensure_worker_status_table(connection)
+            update_worker_status(connection, "connecting")
+            connection.commit()
+
+            timepoint = get_timepoint(connection)
+            params = {"timepoint": timepoint} if timepoint else {}
+            print(f"Connecting from timepoint={timepoint}", flush=True)
+
+            with session.get(
+                STREAM_URL,
+                params=params,
+                stream=True,
+                timeout=(30, 300),
+            ) as response:
+                response.raise_for_status()
+                reconnect_delay = 5
+                update_worker_status(connection, "connected")
+                connection.commit()
+                print("Companies House stream connected.", flush=True)
+
+                for raw_line in response.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
+
+                    received_at = datetime.now(timezone.utc)
+                    event = json.loads(raw_line)
+                    company = event.get("data") or {}
+                    event_timepoint, published_at = extract_metadata(event)
+                    matched = save_matching_company(
+                        connection,
+                        company,
+                        published_at,
+                        received_at,
+                        test_all_sic_codes,
+                        restricted_sic_codes,
+                        rest_api_url,
+                        rest_api_key,
+                    )
+                    save_timepoint(connection, event_timepoint)
+
+                    now = time.monotonic()
+                    if now - last_status_update >= status_interval_seconds:
+                        update_worker_status(
+                            connection,
+                            "connected",
+                            event_received=True,
+                        )
+                        last_status_update = now
+
+                    connection.commit()
+
+                    if matched:
+                        print(
+                            f"Matched {company.get('company_number')} - "
+                            f"{company.get('company_name', 'Unnamed company')}",
+                            flush=True,
+                        )
+
+        except (
+            requests.RequestException,
+            json.JSONDecodeError,
+            psycopg.Error,
+            OSError,
+        ) as error:
+            if connection is not None:
+                try:
+                    update_worker_status(
+                        connection,
+                        "reconnecting",
+                        error=str(error),
+                    )
+                    connection.commit()
+                except psycopg.Error:
+                    pass
+
+            print(
+                f"Background worker disconnected: {error}. "
+                f"Reconnecting in {reconnect_delay} seconds.",
+                flush=True,
+            )
+            time.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 300)
+        finally:
+            if connection is not None:
+                connection.close()
+
+
+def start_background_worker(database_url, api_key, test_all_sic_codes, restricted_sic_codes, rest_api_url, rest_api_key):
+    worker = threading.Thread(
+        target=stream_worker,
+        args=(database_url, api_key, test_all_sic_codes, restricted_sic_codes, rest_api_url, rest_api_key),
+        daemon=True,
+        name="companies-house-stream-worker",
+    )
+    worker.start()
+    return worker
+
+
+@st.cache_resource
+def start_worker_once(database_url, api_key, test_all_sic_codes, restricted_sic_codes, rest_api_url, rest_api_key):
+    return start_background_worker(database_url, api_key, test_all_sic_codes, restricted_sic_codes, rest_api_url, rest_api_key)
+
+
+def get_history(database_url):
+    query = (
+        "SELECT "
+        "company_name AS \"Company name\", "
+        "company_number AS \"Company number\", "
+        "sic_codes AS \"SIC codes\", "
+        "company_url AS \"Companies House page\", "
+        "published_at AS \"Published by Companies House\", "
+        "source_type AS \"Source type\", "
+        "review_status AS \"Review status\" "
+        "FROM public.screened_companies "
+        "WHERE incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date "
+        "  AND review_status = 'approved' "
+        "ORDER BY published_at DESC NULLS LAST, "
+        "received_at DESC NULLS LAST, company_number DESC LIMIT %s"
+    )
+    with get_connection(database_url) as connection:
+        history = dataframe_from_query(connection, query, (DISPLAY_LIMIT,))
+    return add_google_search_links(history)
+
+
+def get_counts(database_url):
+    with get_connection(database_url) as connection:
+        counts = connection.execute(
+            "SELECT COUNT(*) AS total, "
+            "COUNT(*) FILTER (WHERE shortlisted = TRUE) AS shortlisted "
+            "FROM public.screened_companies "
+            "WHERE incorporation_date = "
+            "(NOW() AT TIME ZONE 'Europe/London')::date "
+            "  AND review_status = 'approved'"
+        ).fetchone()
+        status = connection.execute(
+            "SELECT MAX(received_at) AS last_received, "
+            "MAX(published_at) AS last_published, "
+            "COUNT(*) AS all_time_total FROM public.screened_companies"
+        ).fetchone()
+    return counts, status
+
+
+def get_shortlist(database_url):
+    query = (
+        "SELECT "
+        "company_name AS \"Company name\", "
+        "company_number AS \"Company number\", "
+        "sic_codes AS \"SIC codes\", "
+        "company_url AS \"Companies House page\", "
+        "published_at AS \"Published by Companies House\", "
+        "source_type AS \"Source type\" "
+        "FROM public.screened_companies "
+        "WHERE incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date "
+        "  AND shortlisted = TRUE "
+        "  AND review_status = 'approved' "
+        "ORDER BY published_at DESC NULLS LAST, "
+        "received_at DESC NULLS LAST, company_number DESC"
+    )
+    with get_connection(database_url) as connection:
+        shortlist = dataframe_from_query(connection, query)
+    return add_google_search_links(shortlist)
+
+
+def format_age_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add an 'Age (mm:ss)' column showing minutes and seconds since published_at.
+    """
+    now = datetime.now(timezone.utc)
+    ages = []
+    for val in df["Published by Companies House"]:
+        if pd.isna(val):
+            ages.append(None)
+        else:
+            dt = val.to_pydatetime() if hasattr(val, "to_pydatetime") else val
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            delta = now - dt
+            total_seconds = int(delta.total_seconds())
+            minutes = total_seconds // 60
+            seconds = total_seconds % 60
+            ages.append(f"{minutes:02d}:{seconds:02d}")
+    df = df.copy()
+    df["Age (mm:ss)"] = ages
+    return df
+
+
+st.set_page_config(
+    page_title="Live Companies House Screener",
+    page_icon="⚡",
+    layout="wide",
+)
+
+required_secrets = [
+    "DATABASE_URL",
+    "COMPANIES_HOUSE_STREAMING_API_KEY",
+]
+optional_secrets = [
+    "REST_API_URL",
+    "REST_API_KEY",
+    "RESTRICTED_SIC_CODES",
+]
+missing_required = [key for key in required_secrets if key not in st.secrets]
+if missing_required:
+    st.error(
+        "Add these missing values to Streamlit Secrets: "
+        + ", ".join(missing_required)
+    )
+    st.stop()
+
+database_url = st.secrets["DATABASE_URL"]
+api_key = st.secrets["COMPANIES_HOUSE_STREAMING_API_KEY"]
+test_all_sic_codes = str(
+    st.secrets.get("TEST_ALL_SIC_CODES", "false")
+).lower() == "true"
+
+rest_api_url = st.secrets.get("REST_API_URL", "")
+rest_api_key = st.secrets.get("REST_API_KEY", "")
+
+restricted_sic_raw = st.secrets.get("RESTRICTED_SIC_CODES", "")
+restricted_sic_codes = {
+    s.strip()
+    for s in restricted_sic_raw.split(",")
+    if s.strip()
+} if restricted_sic_raw else set()
+
+start_worker_once(
+    database_url,
+    api_key,
+    test_all_sic_codes,
+    restricted_sic_codes,
+    rest_api_url,
+    rest_api_key,
+)
+
+with st.sidebar:
+    st.subheader("Refresh")
+    auto_refresh = st.toggle(
+        "Auto-refresh dashboard",
+        value=True,
+        help="Refresh the visible results every 15 seconds.",
+    )
+    if auto_refresh:
+        st_autorefresh(
+            interval=REFRESH_INTERVAL_MS,
+            debounce=True,
+            key="dashboard_refresh",
+        )
+
+st.title("Live Companies House Screener")
+st.caption(f"Application version: {APP_VERSION}")
+st.caption(
+    "The Companies House worker runs inside Streamlit. "
+    "Only UK companies incorporated today are stored. "
+    "Restricted SIC companies are reviewed via REST API before appearing."
+)
+
+with st.sidebar:
+    st.subheader("System status")
+    database_ok, info, stream, worker, database_error = check_database_connection(
+        database_url
+    )
+    if not database_ok:
+        st.error("Database disconnected")
+        st.code(database_error)
+    else:
+        st.success("Database connected")
+        if worker and worker["status"] == "connected":
+            st.success("Companies House stream connected")
+        elif worker:
+            st.warning(f"Worker status: {worker['status']}")
+            if worker["last_error"]:
+                st.error(worker["last_error"])
+        else:
+            st.warning("No worker status recorded yet")
+
+        with st.expander("Connection details"):
+            st.write(f"Database: {info['database_name']}")
+            st.write(f"Schema: {info['schema_name']}")
+            st.write(f"Database time: {info['database_time']}")
+            if stream:
+                st.write(f"Stream timepoint: {stream['timepoint']}")
+                st.write(f"Checkpoint updated: {stream['updated_at']}")
+            if worker:
+                st.write(f"Last connected: {worker['last_connected_at']}")
+                st.write(f"Last event: {worker['last_event_at']}")
+
+    st.subheader("Notifications")
+    sound_enabled = st.checkbox(
+        "Play a chime for new companies",
+        value=st.session_state.get("sound_enabled", False),
+    )
+    st.session_state.sound_enabled = sound_enabled
+    if sound_enabled and st.button("Test chime"):
+        play_chime()
+        st.success("Chime played")
+
+try:
+    history = get_history(database_url)
+    counts, status = get_counts(database_url)
+except Exception as error:
+    st.error(f"Could not read database: {error}")
+    st.stop()
+
+current_count = int(counts["total"] or 0)
+previous_count = st.session_state.get("known_company_count", current_count)
+new_company = current_count > previous_count
+st.session_state.known_company_count = current_count
+if sound_enabled and new_company:
+    play_chime()
+    st.toast("New company received", icon="🔔")
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Today's approved companies", current_count)
+col2.metric("Displayed", len(history))
+# Shortlist count now only for approved
+col3.metric("Shortlisted today", int(counts["shortlisted"] or 0))
+
+with st.expander("Screening rules"):
+    st.write(
+        "A company is stored only when it was incorporated today in the UK "
+        "and matches a SIC code or a name buzzword. "
+        "Restricted SIC companies are reviewed via REST API before appearing."
+    )
+    st.write(f"Target SIC codes: {', '.join(sorted(TARGET_SIC_CODES))}")
+    st.write(f"Restricted SIC codes: {', '.join(sorted(restricted_sic_codes)) or '(none configured)'}")
+    st.write(f"Name buzzwords: {', '.join(sorted(TARGET_NAME_KEYWORDS))}")
+    st.write(f"Latest received event: {status['last_received'] or 'None'}")
+    st.write(f"Latest published event: {status['last_published'] or 'None'}")
+
+st.subheader("Today's live company results")
+if history.empty:
+    st.info("No matching companies have been received today yet.")
+    st.stop()
+
+history = format_age_column(history)
+
+display_columns = [
+    "Company name",
+    "SIC codes",
+    "Google search",
+    "Companies House page",
+    "Age (mm:ss)",
+]
+
+st.dataframe(
+    history[display_columns],
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Companies House page": st.column_config.LinkColumn(
+            "Companies House page", display_text="Open company page"
+        ),
+        "Google search": st.column_config.LinkColumn(
+            "Google search", display_text="Search Google"
+        ),
+    },
+)
+
+shortlist = get_shortlist(database_url)
+st.subheader("Today's shortlist")
+st.write(f"{len(shortlist)} company(ies) selected today.")
+if shortlist.empty:
+    st.info("Select at least one company above to create a shortlist.")
+else:
+    shortlist = format_age_column(shortlist)
+    st.download_button(
+        "Download today's shortlist as CSV",
+        data=shortlist.to_csv(index=False).encode("utf-8"),
+        file_name="companies_house_shortlist.csv",
+        mime="text/csv",
+        type="primary",
+    )
+    st.dataframe(
+        shortlist[display_columns],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Companies House page": st.column_config.LinkColumn(
+                "Companies House page", display_text="Open company page"
+            ),
+            "Google search": st.column_config.LinkColumn(
+                "Google search", display_text="Search Google"
+            ),
+        },
+    )
