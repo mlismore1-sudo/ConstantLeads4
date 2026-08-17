@@ -17,7 +17,7 @@ import streamlit as st
 from psycopg.rows import dict_row
 from streamlit_autorefresh import st_autorefresh
 
-APP_VERSION = "2026-08-17-restricted-sic-rest-review"
+APP_VERSION = "2026-08-17-restricted-sic-in-app-review"
 STREAM_URL = "https://stream.companieshouse.gov.uk/companies"
 DISPLAY_LIMIT = 250
 REFRESH_INTERVAL_MS = 15000
@@ -201,72 +201,78 @@ def save_timepoint(connection, timepoint):
     )
 
 
-def call_rest_api_for_review(company, rest_api_url, rest_api_key):
+def review_company_in_app(company, rest_api_key):
     """
-    Call your external REST API to check:
-      - if a company is an owner in the shareholder structure
-      - if any director lives in an EU country or USA
-    Return a dict:
+    In-app 'REST API' logic for restricted SIC companies.
+
+    This is where you:
+      - Call your data sources (Companies House, other providers, etc.)
+      - Determine:
+          * has_company_shareholder
+          * eu_director_countries (list of country codes)
+          * us_director
+      - Apply your business rules to decide review_status.
+
+    rest_api_key is available from secrets if you want to use it as a token
+    for external calls or simply keep it for future compatibility.
+
+    Returns a dict:
       {
         "has_company_shareholder": bool,
         "eu_director_countries": "DE,FR,...",
         "us_director": bool,
         "review_status": "approved" | "rejected",
-        "payload": {...raw JSON...}
+        "payload": {...raw data / debug info...}
       }
-    Adjust this to your actual API contract.
     """
-    if not rest_api_url or not rest_api_key:
-        # No API configured: default to approve
-        return {
-            "has_company_shareholder": False,
-            "eu_director_countries": "",
-            "us_director": False,
-            "review_status": "approved",
-            "payload": {"note": "No REST API configured"},
-        }
+    company_number = company.get("company_number")
+    company_name = company.get("company_name")
+    sic_codes = company.get("sic_codes") or []
 
-    try:
-        resp = requests.post(
-            rest_api_url,
-            json={"company": company},
-            headers={"Authorization": f"Bearer {rest_api_key}"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    # TODO: Replace this block with your actual data lookups and logic.
+    # Example:
+    #   - Call Companies House API (or other provider) to get:
+    #       * persons with significant control (PSC) / shareholders
+    #       * directors and their addresses
+    #   - Implement your rules for:
+    #       * corporate shareholders
+    #       * EU/US director residence
 
-        # Adapt these mappings to your API's response schema
-        has_company_shareholder = bool(data.get("has_company_shareholder", False))
-        eu_director_countries = ",".join(
-            sorted(set(str(c).upper() for c in (data.get("eu_director_countries") or [])))
-        )
-        us_director = bool(data.get("us_director", False))
+    # Placeholder logic (replace with real implementation):
+    has_company_shareholder = False  # e.g. True if any PSC is a corporate entity
+    eu_director_countries_list = []  # e.g. ["DE", "FR"] if directors live there
+    us_director = False              # e.g. True if any director address is in USA
 
-        # Your business rule for approval; adjust as needed
-        is_risky = (
-            has_company_shareholder
-            or eu_director_countries
-            or us_director
-        )
-        review_status = "rejected" if is_risky else "approved"
+    eu_director_countries = ",".join(
+        sorted(set(str(c).upper() for c in eu_director_countries_list))
+    )
 
-        return {
-            "has_company_shareholder": has_company_shareholder,
-            "eu_director_countries": eu_director_countries,
-            "us_director": us_director,
-            "review_status": review_status,
-            "payload": data,
-        }
-    except Exception:
-        # On error, default to pending (do not auto-approve)
-        return {
-            "has_company_shareholder": None,
-            "eu_director_countries": None,
-            "us_director": None,
-            "review_status": "pending",
-            "payload": {"error": "REST API call failed"},
-        }
+    # Business rule: reject if any risk factor is present
+    is_risky = (
+        has_company_shareholder
+        or eu_director_countries
+        or us_director
+    )
+    review_status = "rejected" if is_risky else "approved"
+
+    payload = {
+        "company_number": company_number,
+        "company_name": company_name,
+        "sic_codes": sic_codes,
+        "has_company_shareholder": has_company_shareholder,
+        "eu_director_countries_list": eu_director_countries_list,
+        "us_director": us_director,
+        "note": "In-app review (Pattern A, no external HTTP)",
+        "rest_api_key_present": bool(rest_api_key),
+    }
+
+    return {
+        "has_company_shareholder": has_company_shareholder,
+        "eu_director_countries": eu_director_countries,
+        "us_director": us_director,
+        "review_status": review_status,
+        "payload": payload,
+    }
 
 
 def save_matching_company(
@@ -276,7 +282,6 @@ def save_matching_company(
     received_at,
     test_all_sic_codes,
     restricted_sic_codes,
-    rest_api_url,
     rest_api_key,
 ):
     company_number = company.get("company_number")
@@ -306,12 +311,11 @@ def save_matching_company(
         review_status = "approved"
     elif sic_matches_restricted:
         source_type = "restricted_sic"
+        # Will be overwritten by in-app review
         review_status = "pending"
     else:
-        # Not a company we care about
         if not test_all_sic_codes:
             return False
-        # If test_all_sic_codes is True, treat as target_sic for debugging
         source_type = "target_sic"
         review_status = "approved"
 
@@ -320,16 +324,13 @@ def save_matching_company(
         f"{company_number}"
     )
 
-    # For restricted_sic, call REST API to determine review_status and enrichment
     has_company_shareholder = None
     eu_director_countries = None
     us_director = None
     rest_api_payload = None
 
     if source_type == "restricted_sic":
-        review_result = call_rest_api_for_review(
-            company, rest_api_url, rest_api_key
-        )
+        review_result = review_company_in_app(company, rest_api_key)
         review_status = review_result["review_status"]
         has_company_shareholder = review_result["has_company_shareholder"]
         eu_director_countries = review_result["eu_director_countries"]
@@ -383,7 +384,13 @@ def save_matching_company(
     return True
 
 
-def stream_worker(database_url, api_key, test_all_sic_codes, restricted_sic_codes, rest_api_url, rest_api_key):
+def stream_worker(
+    database_url,
+    api_key,
+    test_all_sic_codes,
+    restricted_sic_codes,
+    rest_api_key,
+):
     reconnect_delay = 5
     status_interval_seconds = 30
     last_status_update = 0.0
@@ -438,7 +445,6 @@ def stream_worker(database_url, api_key, test_all_sic_codes, restricted_sic_code
                         received_at,
                         test_all_sic_codes,
                         restricted_sic_codes,
-                        rest_api_url,
                         rest_api_key,
                     )
                     save_timepoint(connection, event_timepoint)
@@ -490,10 +496,22 @@ def stream_worker(database_url, api_key, test_all_sic_codes, restricted_sic_code
                 connection.close()
 
 
-def start_background_worker(database_url, api_key, test_all_sic_codes, restricted_sic_codes, rest_api_url, rest_api_key):
+def start_background_worker(
+    database_url,
+    api_key,
+    test_all_sic_codes,
+    restricted_sic_codes,
+    rest_api_key,
+):
     worker = threading.Thread(
         target=stream_worker,
-        args=(database_url, api_key, test_all_sic_codes, restricted_sic_codes, rest_api_url, rest_api_key),
+        args=(
+            database_url,
+            api_key,
+            test_all_sic_codes,
+            restricted_sic_codes,
+            rest_api_key,
+        ),
         daemon=True,
         name="companies-house-stream-worker",
     )
@@ -502,8 +520,20 @@ def start_background_worker(database_url, api_key, test_all_sic_codes, restricte
 
 
 @st.cache_resource
-def start_worker_once(database_url, api_key, test_all_sic_codes, restricted_sic_codes, rest_api_url, rest_api_key):
-    return start_background_worker(database_url, api_key, test_all_sic_codes, restricted_sic_codes, rest_api_url, rest_api_key)
+def start_worker_once(
+    database_url,
+    api_key,
+    test_all_sic_codes,
+    restricted_sic_codes,
+    rest_api_key,
+):
+    return start_background_worker(
+        database_url,
+        api_key,
+        test_all_sic_codes,
+        restricted_sic_codes,
+        rest_api_key,
+    )
 
 
 def get_history(database_url):
@@ -599,11 +629,6 @@ required_secrets = [
     "DATABASE_URL",
     "COMPANIES_HOUSE_STREAMING_API_KEY",
 ]
-optional_secrets = [
-    "REST_API_URL",
-    "REST_API_KEY",
-    "RESTRICTED_SIC_CODES",
-]
 missing_required = [key for key in required_secrets if key not in st.secrets]
 if missing_required:
     st.error(
@@ -618,7 +643,6 @@ test_all_sic_codes = str(
     st.secrets.get("TEST_ALL_SIC_CODES", "false")
 ).lower() == "true"
 
-rest_api_url = st.secrets.get("REST_API_URL", "")
 rest_api_key = st.secrets.get("REST_API_KEY", "")
 
 restricted_sic_raw = st.secrets.get("RESTRICTED_SIC_CODES", "")
@@ -633,7 +657,6 @@ start_worker_once(
     api_key,
     test_all_sic_codes,
     restricted_sic_codes,
-    rest_api_url,
     rest_api_key,
 )
 
@@ -656,7 +679,7 @@ st.caption(f"Application version: {APP_VERSION}")
 st.caption(
     "The Companies House worker runs inside Streamlit. "
     "Only UK companies incorporated today are stored. "
-    "Restricted SIC companies are reviewed via REST API before appearing."
+    "Restricted SIC companies are reviewed in-app before appearing."
 )
 
 with st.sidebar:
@@ -717,17 +740,18 @@ if sound_enabled and new_company:
 col1, col2, col3 = st.columns(3)
 col1.metric("Today's approved companies", current_count)
 col2.metric("Displayed", len(history))
-# Shortlist count now only for approved
 col3.metric("Shortlisted today", int(counts["shortlisted"] or 0))
 
 with st.expander("Screening rules"):
     st.write(
         "A company is stored only when it was incorporated today in the UK "
         "and matches a SIC code or a name buzzword. "
-        "Restricted SIC companies are reviewed via REST API before appearing."
+        "Restricted SIC companies are reviewed in-app before appearing."
     )
     st.write(f"Target SIC codes: {', '.join(sorted(TARGET_SIC_CODES))}")
-    st.write(f"Restricted SIC codes: {', '.join(sorted(restricted_sic_codes)) or '(none configured)'}")
+    st.write(
+        f"Restricted SIC codes: {', '.join(sorted(restricted_sic_codes)) or '(none configured)'}"
+    )
     st.write(f"Name buzzwords: {', '.join(sorted(TARGET_NAME_KEYWORDS))}")
     st.write(f"Latest received event: {status['last_received'] or 'None'}")
     st.write(f"Latest published event: {status['last_published'] or 'None'}")
