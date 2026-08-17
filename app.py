@@ -17,7 +17,7 @@ import streamlit as st
 from psycopg.rows import dict_row
 from streamlit_autorefresh import st_autorefresh
 
-APP_VERSION = "2026-08-17-two-dashboards-leaderboard"
+APP_VERSION = "2026-08-17-two-dashboards-no-leaderboard-query"
 STREAM_URL = "https://stream.companieshouse.gov.uk/companies"
 DISPLAY_LIMIT = 250
 REFRESH_INTERVAL_MS = 15000
@@ -479,20 +479,6 @@ def get_counts(database_url):
     return counts, status
 
 
-def get_user_shortlist_counts(database_url):
-    with get_connection(database_url) as connection:
-        row = connection.execute(
-            "SELECT "
-            "COUNT(*) FILTER (WHERE user_name = 'Brad') AS brad, "
-            "COUNT(*) FILTER (WHERE user_name = 'James') AS james "
-            "FROM public.user_shortlists s "
-            "JOIN public.screened_companies c "
-            "  ON c.company_number = s.company_number "
-            "WHERE c.incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date"
-        ).fetchone()
-    return int(row["brad"] or 0), int(row["james"] or 0)
-
-
 def format_age_column(df: pd.DataFrame) -> pd.DataFrame:
     now = datetime.now(timezone.utc)
     ages = []
@@ -613,24 +599,6 @@ with st.sidebar:
         ["Brad", "James"],
         index=0,
     )
-
-    # Leaderboard
-    brad_count, james_count = get_user_shortlist_counts(database_url)
-    st.subheader("Leaderboard 🏆")
-    if brad_count > james_count:
-        st.success(f"**Brad** is leading ({brad_count} vs {james_count})")
-    elif james_count > brad_count:
-        st.info(f"**James** is leading ({james_count} vs {brad_count})")
-    else:
-        st.warning(f"**Tied** at {brad_count} each")
-
-    leaderboard_df = pd.DataFrame(
-        {
-            "User": ["Brad", "James"],
-            "Shortlisted today": [brad_count, james_count],
-        }
-    )
-    st.bar_chart(leaderboard_df.set_index("User"))
 
     st.subheader("Refresh")
     auto_refresh = st.toggle(
