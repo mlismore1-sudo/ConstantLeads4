@@ -17,7 +17,7 @@ import streamlit as st
 from psycopg.rows import dict_row
 from streamlit_autorefresh import st_autorefresh
 
-APP_VERSION = "2026-08-17-restricted-sic-in-app-review"
+APP_VERSION = "2026-08-17-two-dashboards-no-rest"
 STREAM_URL = "https://stream.companieshouse.gov.uk/companies"
 DISPLAY_LIMIT = 250
 REFRESH_INTERVAL_MS = 15000
@@ -201,80 +201,6 @@ def save_timepoint(connection, timepoint):
     )
 
 
-def review_company_in_app(company, rest_api_key):
-    """
-    In-app 'REST API' logic for restricted SIC companies.
-
-    This is where you:
-      - Call your data sources (Companies House, other providers, etc.)
-      - Determine:
-          * has_company_shareholder
-          * eu_director_countries (list of country codes)
-          * us_director
-      - Apply your business rules to decide review_status.
-
-    rest_api_key is available from secrets if you want to use it as a token
-    for external calls or simply keep it for future compatibility.
-
-    Returns a dict:
-      {
-        "has_company_shareholder": bool,
-        "eu_director_countries": "DE,FR,...",
-        "us_director": bool,
-        "review_status": "approved" | "rejected",
-        "payload": {...raw data / debug info...}
-      }
-    """
-    company_number = company.get("company_number")
-    company_name = company.get("company_name")
-    sic_codes = company.get("sic_codes") or []
-
-    # TODO: Replace this block with your actual data lookups and logic.
-    # Example:
-    #   - Call Companies House API (or other provider) to get:
-    #       * persons with significant control (PSC) / shareholders
-    #       * directors and their addresses
-    #   - Implement your rules for:
-    #       * corporate shareholders
-    #       * EU/US director residence
-
-    # Placeholder logic (replace with real implementation):
-    has_company_shareholder = False  # e.g. True if any PSC is a corporate entity
-    eu_director_countries_list = []  # e.g. ["DE", "FR"] if directors live there
-    us_director = False              # e.g. True if any director address is in USA
-
-    eu_director_countries = ",".join(
-        sorted(set(str(c).upper() for c in eu_director_countries_list))
-    )
-
-    # Business rule: reject if any risk factor is present
-    is_risky = (
-        has_company_shareholder
-        or eu_director_countries
-        or us_director
-    )
-    review_status = "rejected" if is_risky else "approved"
-
-    payload = {
-        "company_number": company_number,
-        "company_name": company_name,
-        "sic_codes": sic_codes,
-        "has_company_shareholder": has_company_shareholder,
-        "eu_director_countries_list": eu_director_countries_list,
-        "us_director": us_director,
-        "note": "In-app review (Pattern A, no external HTTP)",
-        "rest_api_key_present": bool(rest_api_key),
-    }
-
-    return {
-        "has_company_shareholder": has_company_shareholder,
-        "eu_director_countries": eu_director_countries,
-        "us_director": us_director,
-        "review_status": review_status,
-        "payload": payload,
-    }
-
-
 def save_matching_company(
     connection,
     company,
@@ -282,7 +208,6 @@ def save_matching_company(
     received_at,
     test_all_sic_codes,
     restricted_sic_codes,
-    rest_api_key,
 ):
     company_number = company.get("company_number")
     company_name = company.get("company_name") or "Unnamed company"
@@ -294,7 +219,6 @@ def save_matching_company(
     if not company_number:
         return False
 
-    # Only save companies incorporated on the current UK calendar date.
     if incorporation_date != today_in_uk():
         return False
 
@@ -302,49 +226,28 @@ def save_matching_company(
     sic_matches_restricted = bool(sic_codes.intersection(restricted_sic_codes))
     name_matches = name_matches_target_keywords(company_name)
 
-    # Determine source_type and initial review_status
     if sic_matches_target:
         source_type = "target_sic"
-        review_status = "approved"
     elif name_matches:
         source_type = "buzzword"
-        review_status = "approved"
     elif sic_matches_restricted:
         source_type = "restricted_sic"
-        # Will be overwritten by in-app review
-        review_status = "pending"
     else:
         if not test_all_sic_codes:
             return False
         source_type = "target_sic"
-        review_status = "approved"
 
     company_url = (
         "https://find-and-update.company-information.service.gov.uk/company/"
         f"{company_number}"
     )
 
-    has_company_shareholder = None
-    eu_director_countries = None
-    us_director = None
-    rest_api_payload = None
-
-    if source_type == "restricted_sic":
-        review_result = review_company_in_app(company, rest_api_key)
-        review_status = review_result["review_status"]
-        has_company_shareholder = review_result["has_company_shareholder"]
-        eu_director_countries = review_result["eu_director_countries"]
-        us_director = review_result["us_director"]
-        rest_api_payload = review_result["payload"]
-
     connection.execute(
         "INSERT INTO public.screened_companies ("
         "company_number, company_name, incorporation_date, company_status, "
         "sic_codes, company_url, screened_at, shortlisted, published_at, received_at, "
-        "source_type, review_status, "
-        "has_company_shareholder, eu_director_countries, us_director, "
-        "rest_api_reviewed_at, rest_api_payload"
-        ") VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "source_type, review_status"
+        ") VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s, %s, %s) "
         "ON CONFLICT (company_number) DO UPDATE SET "
         "company_name = EXCLUDED.company_name, "
         "incorporation_date = EXCLUDED.incorporation_date, "
@@ -354,14 +257,7 @@ def save_matching_company(
         "public.screened_companies.published_at), "
         "received_at = EXCLUDED.received_at, "
         "source_type = EXCLUDED.source_type, "
-        "review_status = EXCLUDED.review_status, "
-        "has_company_shareholder = EXCLUDED.has_company_shareholder, "
-        "eu_director_countries = EXCLUDED.eu_director_countries, "
-        "us_director = EXCLUDED.us_director, "
-        "rest_api_reviewed_at = COALESCE(EXCLUDED.rest_api_reviewed_at, "
-        "public.screened_companies.rest_api_reviewed_at), "
-        "rest_api_payload = COALESCE(EXCLUDED.rest_api_payload, "
-        "public.screened_companies.rest_api_payload)",
+        "review_status = EXCLUDED.review_status",
         (
             company_number,
             company_name,
@@ -373,12 +269,7 @@ def save_matching_company(
             published_at,
             received_at,
             source_type,
-            review_status,
-            has_company_shareholder,
-            eu_director_countries,
-            us_director,
-            datetime.now(timezone.utc) if rest_api_payload else None,
-            json.dumps(rest_api_payload) if rest_api_payload else None,
+            "approved",  # all are approved; we just split by source_type in UI
         ),
     )
     return True
@@ -389,7 +280,6 @@ def stream_worker(
     api_key,
     test_all_sic_codes,
     restricted_sic_codes,
-    rest_api_key,
 ):
     reconnect_delay = 5
     status_interval_seconds = 30
@@ -445,7 +335,6 @@ def stream_worker(
                         received_at,
                         test_all_sic_codes,
                         restricted_sic_codes,
-                        rest_api_key,
                     )
                     save_timepoint(connection, event_timepoint)
 
@@ -501,7 +390,6 @@ def start_background_worker(
     api_key,
     test_all_sic_codes,
     restricted_sic_codes,
-    rest_api_key,
 ):
     worker = threading.Thread(
         target=stream_worker,
@@ -510,7 +398,6 @@ def start_background_worker(
             api_key,
             test_all_sic_codes,
             restricted_sic_codes,
-            rest_api_key,
         ),
         daemon=True,
         name="companies-house-stream-worker",
@@ -525,57 +412,16 @@ def start_worker_once(
     api_key,
     test_all_sic_codes,
     restricted_sic_codes,
-    rest_api_key,
 ):
     return start_background_worker(
         database_url,
         api_key,
         test_all_sic_codes,
         restricted_sic_codes,
-        rest_api_key,
     )
 
 
-def get_history(database_url):
-    query = (
-        "SELECT "
-        "company_name AS \"Company name\", "
-        "company_number AS \"Company number\", "
-        "sic_codes AS \"SIC codes\", "
-        "company_url AS \"Companies House page\", "
-        "published_at AS \"Published by Companies House\", "
-        "source_type AS \"Source type\", "
-        "review_status AS \"Review status\" "
-        "FROM public.screened_companies "
-        "WHERE incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date "
-        "  AND review_status = 'approved' "
-        "ORDER BY published_at DESC NULLS LAST, "
-        "received_at DESC NULLS LAST, company_number DESC LIMIT %s"
-    )
-    with get_connection(database_url) as connection:
-        history = dataframe_from_query(connection, query, (DISPLAY_LIMIT,))
-    return add_google_search_links(history)
-
-
-def get_counts(database_url):
-    with get_connection(database_url) as connection:
-        counts = connection.execute(
-            "SELECT COUNT(*) AS total, "
-            "COUNT(*) FILTER (WHERE shortlisted = TRUE) AS shortlisted "
-            "FROM public.screened_companies "
-            "WHERE incorporation_date = "
-            "(NOW() AT TIME ZONE 'Europe/London')::date "
-            "  AND review_status = 'approved'"
-        ).fetchone()
-        status = connection.execute(
-            "SELECT MAX(received_at) AS last_received, "
-            "MAX(published_at) AS last_published, "
-            "COUNT(*) AS all_time_total FROM public.screened_companies"
-        ).fetchone()
-    return counts, status
-
-
-def get_shortlist(database_url):
+def get_target_and_buzzword_companies(database_url):
     query = (
         "SELECT "
         "company_name AS \"Company name\", "
@@ -586,20 +432,54 @@ def get_shortlist(database_url):
         "source_type AS \"Source type\" "
         "FROM public.screened_companies "
         "WHERE incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date "
-        "  AND shortlisted = TRUE "
-        "  AND review_status = 'approved' "
+        "  AND source_type IN ('target_sic', 'buzzword') "
+        "ORDER BY published_at DESC NULLS LAST, "
+        "received_at DESC NULLS LAST, company_number DESC LIMIT %s"
+    )
+    with get_connection(database_url) as connection:
+        df = dataframe_from_query(connection, query, (DISPLAY_LIMIT,))
+    return add_google_search_links(df)
+
+
+def get_restricted_sic_companies(database_url):
+    query = (
+        "SELECT "
+        "company_name AS \"Company name\", "
+        "company_number AS \"Company number\", "
+        "sic_codes AS \"SIC codes\", "
+        "company_url AS \"Companies House page\", "
+        "published_at AS \"Published by Companies House\", "
+        "source_type AS \"Source type\" "
+        "FROM public.screened_companies "
+        "WHERE incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date "
+        "  AND source_type = 'restricted_sic' "
         "ORDER BY published_at DESC NULLS LAST, "
         "received_at DESC NULLS LAST, company_number DESC"
     )
     with get_connection(database_url) as connection:
-        shortlist = dataframe_from_query(connection, query)
-    return add_google_search_links(shortlist)
+        df = dataframe_from_query(connection, query)
+    return add_google_search_links(df)
+
+
+def get_counts(database_url):
+    with get_connection(database_url) as connection:
+        counts = connection.execute(
+            "SELECT "
+            "COUNT(*) FILTER (WHERE source_type IN ('target_sic', 'buzzword')) AS target_buzzword, "
+            "COUNT(*) FILTER (WHERE source_type = 'restricted_sic') AS restricted, "
+            "COUNT(*) AS total "
+            "FROM public.screened_companies "
+            "WHERE incorporation_date = (NOW AT TIME ZONE 'Europe/London')::date"
+        ).fetchone()
+        status = connection.execute(
+            "SELECT MAX(received_at) AS last_received, "
+            "MAX(published_at) AS last_published, "
+            "COUNT(*) AS all_time_total FROM public.screened_companies"
+        ).fetchone()
+    return counts, status
 
 
 def format_age_column(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add an 'Age (mm:ss)' column showing minutes and seconds since published_at.
-    """
     now = datetime.now(timezone.utc)
     ages = []
     for val in df["Published by Companies House"]:
@@ -643,8 +523,6 @@ test_all_sic_codes = str(
     st.secrets.get("TEST_ALL_SIC_CODES", "false")
 ).lower() == "true"
 
-rest_api_key = st.secrets.get("REST_API_KEY", "")
-
 restricted_sic_raw = st.secrets.get("RESTRICTED_SIC_CODES", "")
 restricted_sic_codes = {
     s.strip()
@@ -657,7 +535,6 @@ start_worker_once(
     api_key,
     test_all_sic_codes,
     restricted_sic_codes,
-    rest_api_key,
 )
 
 with st.sidebar:
@@ -679,7 +556,7 @@ st.caption(f"Application version: {APP_VERSION}")
 st.caption(
     "The Companies House worker runs inside Streamlit. "
     "Only UK companies incorporated today are stored. "
-    "Restricted SIC companies are reviewed in-app before appearing."
+    "Two dashboards: Target & Buzzword vs Restricted SIC."
 )
 
 with st.sidebar:
@@ -723,30 +600,20 @@ with st.sidebar:
         st.success("Chime played")
 
 try:
-    history = get_history(database_url)
     counts, status = get_counts(database_url)
 except Exception as error:
     st.error(f"Could not read database: {error}")
     st.stop()
 
-current_count = int(counts["total"] or 0)
-previous_count = st.session_state.get("known_company_count", current_count)
-new_company = current_count > previous_count
-st.session_state.known_company_count = current_count
-if sound_enabled and new_company:
-    play_chime()
-    st.toast("New company received", icon="🔔")
-
 col1, col2, col3 = st.columns(3)
-col1.metric("Today's approved companies", current_count)
-col2.metric("Displayed", len(history))
-col3.metric("Shortlisted today", int(counts["shortlisted"] or 0))
+col1.metric("Target & Buzzword today", int(counts["target_buzzword"] or 0))
+col2.metric("Restricted SIC today", int(counts["restricted"] or 0))
+col3.metric("Total today", int(counts["total"] or 0))
 
 with st.expander("Screening rules"):
     st.write(
         "A company is stored only when it was incorporated today in the UK "
-        "and matches a SIC code or a name buzzword. "
-        "Restricted SIC companies are reviewed in-app before appearing."
+        "and matches a SIC code or a name buzzword."
     )
     st.write(f"Target SIC codes: {', '.join(sorted(TARGET_SIC_CODES))}")
     st.write(
@@ -756,51 +623,23 @@ with st.expander("Screening rules"):
     st.write(f"Latest received event: {status['last_received'] or 'None'}")
     st.write(f"Latest published event: {status['last_published'] or 'None'}")
 
-st.subheader("Today's live company results")
-if history.empty:
-    st.info("No matching companies have been received today yet.")
-    st.stop()
+st.subheader("Target & Buzzword Companies")
+target_buzzword = get_target_and_buzzword_companies(database_url)
 
-history = format_age_column(history)
-
-display_columns = [
-    "Company name",
-    "SIC codes",
-    "Google search",
-    "Companies House page",
-    "Age (mm:ss)",
-]
-
-st.dataframe(
-    history[display_columns],
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "Companies House page": st.column_config.LinkColumn(
-            "Companies House page", display_text="Open company page"
-        ),
-        "Google search": st.column_config.LinkColumn(
-            "Google search", display_text="Search Google"
-        ),
-    },
-)
-
-shortlist = get_shortlist(database_url)
-st.subheader("Today's shortlist")
-st.write(f"{len(shortlist)} company(ies) selected today.")
-if shortlist.empty:
-    st.info("Select at least one company above to create a shortlist.")
+if target_buzzword.empty:
+    st.info("No target SIC or buzzword companies have been received today yet.")
 else:
-    shortlist = format_age_column(shortlist)
-    st.download_button(
-        "Download today's shortlist as CSV",
-        data=shortlist.to_csv(index=False).encode("utf-8"),
-        file_name="companies_house_shortlist.csv",
-        mime="text/csv",
-        type="primary",
-    )
+    target_buzzword = format_age_column(target_buzzword)
+    display_columns = [
+        "Company name",
+        "SIC codes",
+        "Google search",
+        "Companies House page",
+        "Age (mm:ss)",
+    ]
+
     st.dataframe(
-        shortlist[display_columns],
+        target_buzzword[display_columns],
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -811,4 +650,51 @@ else:
                 "Google search", display_text="Search Google"
             ),
         },
+    )
+
+    st.download_button(
+        "Download Target & Buzzword as CSV",
+        data=target_buzzword.to_csv(index=False).encode("utf-8"),
+        file_name="target_buzzword_companies.csv",
+        mime="text/csv",
+        type="primary",
+    )
+
+st.divider()
+
+st.subheader("Restricted SIC Companies (for external review)")
+restricted = get_restricted_sic_companies(database_url)
+
+if restricted.empty:
+    st.info("No restricted SIC companies have been received today yet.")
+else:
+    restricted = format_age_column(restricted)
+    display_columns = [
+        "Company name",
+        "SIC codes",
+        "Google search",
+        "Companies House page",
+        "Age (mm:ss)",
+    ]
+
+    st.dataframe(
+        restricted[display_columns],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Companies House page": st.column_config.LinkColumn(
+                "Companies House page", display_text="Open company page"
+            ),
+            "Google search": st.column_config.LinkColumn(
+                "Google search", display_text="Search Google"
+            ),
+        },
+    )
+
+    st.download_button(
+        "Download Restricted SIC as CSV",
+        data=restricted.to_csv(index=False).encode("utf-8"),
+        file_name="restricted_sic_companies.csv",
+        mime="text/csv",
+        type="primary",
     )
