@@ -17,7 +17,7 @@ import streamlit as st
 from psycopg.rows import dict_row
 from streamlit_autorefresh import st_autorefresh
 
-APP_VERSION = "2026-08-17-two-dashboards-no-rest"
+APP_VERSION = "2026-08-17-two-dashboards-leaderboard"
 STREAM_URL = "https://stream.companieshouse.gov.uk/companies"
 DISPLAY_LIMIT = 250
 REFRESH_INTERVAL_MS = 15000
@@ -245,9 +245,9 @@ def save_matching_company(
     connection.execute(
         "INSERT INTO public.screened_companies ("
         "company_number, company_name, incorporation_date, company_status, "
-        "sic_codes, company_url, screened_at, shortlisted, published_at, received_at, "
+        "sic_codes, company_url, screened_at, published_at, received_at, "
         "source_type, review_status"
-        ") VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE, %s, %s, %s, %s) "
+        ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (company_number) DO UPDATE SET "
         "company_name = EXCLUDED.company_name, "
         "incorporation_date = EXCLUDED.incorporation_date, "
@@ -269,7 +269,7 @@ def save_matching_company(
             published_at,
             received_at,
             source_type,
-            "approved",  # all are approved; we just split by source_type in UI
+            "approved",
         ),
     )
     return True
@@ -479,6 +479,20 @@ def get_counts(database_url):
     return counts, status
 
 
+def get_user_shortlist_counts(database_url):
+    with get_connection(database_url) as connection:
+        row = connection.execute(
+            "SELECT "
+            "COUNT(*) FILTER (WHERE user_name = 'Brad') AS brad, "
+            "COUNT(*) FILTER (WHERE user_name = 'James') AS james "
+            "FROM public.user_shortlists s "
+            "JOIN public.screened_companies c "
+            "  ON c.company_number = s.company_number "
+            "WHERE c.incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date"
+        ).fetchone()
+    return int(row["brad"] or 0), int(row["james"] or 0)
+
+
 def format_age_column(df: pd.DataFrame) -> pd.DataFrame:
     now = datetime.now(timezone.utc)
     ages = []
@@ -497,6 +511,61 @@ def format_age_column(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["Age (mm:ss)"] = ages
     return df
+
+
+def ensure_user_shortlists_table(connection):
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS public.user_shortlists ("
+        "company_number TEXT NOT NULL, "
+        "user_name TEXT NOT NULL, "
+        "shortlisted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+        "PRIMARY KEY (company_number, user_name))"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_user_shortlists_user_name "
+        "ON public.user_shortlists (user_name)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_user_shortlists_company_number "
+        "ON public.user_shortlists (company_number)"
+    )
+
+
+def set_user_shortlist(connection, company_number, user_name, is_shortlisted):
+    if is_shortlisted:
+        connection.execute(
+            "INSERT INTO public.user_shortlists (company_number, user_name, shortlisted_at) "
+            "VALUES (%s, %s, NOW()) "
+            "ON CONFLICT (company_number, user_name) DO NOTHING",
+            (company_number, user_name),
+        )
+    else:
+        connection.execute(
+            "DELETE FROM public.user_shortlists "
+            "WHERE company_number = %s AND user_name = %s",
+            (company_number, user_name),
+        )
+
+
+def get_user_shortlist_companies(database_url, user_name):
+    query = (
+        "SELECT "
+        "c.company_name AS \"Company name\", "
+        "c.company_number AS \"Company number\", "
+        "c.sic_codes AS \"SIC codes\", "
+        "c.company_url AS \"Companies House page\", "
+        "c.published_at AS \"Published by Companies House\", "
+        "c.source_type AS \"Source type\" "
+        "FROM public.user_shortlists s "
+        "JOIN public.screened_companies c "
+        "  ON c.company_number = s.company_number "
+        "WHERE s.user_name = %s "
+        "  AND c.incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date "
+        "ORDER BY c.published_at DESC NULLS LAST, c.received_at DESC NULLS LAST, c.company_number DESC"
+    )
+    with get_connection(database_url) as connection:
+        df = dataframe_from_query(connection, query, (user_name,))
+    return add_google_search_links(df)
 
 
 st.set_page_config(
@@ -538,6 +607,31 @@ start_worker_once(
 )
 
 with st.sidebar:
+    st.subheader("Who is working?")
+    user = st.radio(
+        "Select user",
+        ["Brad", "James"],
+        index=0,
+    )
+
+    # Leaderboard
+    brad_count, james_count = get_user_shortlist_counts(database_url)
+    st.subheader("Leaderboard 🏆")
+    if brad_count > james_count:
+        st.success(f"**Brad** is leading ({brad_count} vs {james_count})")
+    elif james_count > brad_count:
+        st.info(f"**James** is leading ({james_count} vs {brad_count})")
+    else:
+        st.warning(f"**Tied** at {brad_count} each")
+
+    leaderboard_df = pd.DataFrame(
+        {
+            "User": ["Brad", "James"],
+            "Shortlisted today": [brad_count, james_count],
+        }
+    )
+    st.bar_chart(leaderboard_df.set_index("User"))
+
     st.subheader("Refresh")
     auto_refresh = st.toggle(
         "Auto-refresh dashboard",
@@ -605,6 +699,14 @@ except Exception as error:
     st.error(f"Could not read database: {error}")
     st.stop()
 
+current_count = int(counts["total"] or 0)
+previous_count = st.session_state.get("known_company_count", current_count)
+new_company = current_count > previous_count
+st.session_state.known_company_count = current_count
+if sound_enabled and new_company:
+    play_chime()
+    st.toast("New company received", icon="🔔")
+
 col1, col2, col3 = st.columns(3)
 col1.metric("Target & Buzzword today", int(counts["target_buzzword"] or 0))
 col2.metric("Restricted SIC today", int(counts["restricted"] or 0))
@@ -623,6 +725,11 @@ with st.expander("Screening rules"):
     st.write(f"Latest received event: {status['last_received'] or 'None'}")
     st.write(f"Latest published event: {status['last_published'] or 'None'}")
 
+# Ensure user_shortlists table exists
+with get_connection(database_url) as connection:
+    ensure_user_shortlists_table(connection)
+    connection.commit()
+
 st.subheader("Target & Buzzword Companies")
 target_buzzword = get_target_and_buzzword_companies(database_url)
 
@@ -630,7 +737,20 @@ if target_buzzword.empty:
     st.info("No target SIC or buzzword companies have been received today yet.")
 else:
     target_buzzword = format_age_column(target_buzzword)
+
+    target_buzzword = target_buzzword.copy()
+    target_buzzword["Shortlist"] = False
+
+    with get_connection(database_url) as connection:
+        rows = connection.execute(
+            "SELECT company_number FROM public.user_shortlists WHERE user_name = %s",
+            (user,),
+        ).fetchall()
+    shortlisted_numbers = {r["company_number"] for r in rows}
+    target_buzzword["Shortlist"] = target_buzzword["Company number"].isin(shortlisted_numbers)
+
     display_columns = [
+        "Shortlist",
         "Company name",
         "SIC codes",
         "Google search",
@@ -638,11 +758,16 @@ else:
         "Age (mm:ss)",
     ]
 
-    st.dataframe(
+    edited = st.data_editor(
         target_buzzword[display_columns],
         use_container_width=True,
         hide_index=True,
+        key="target_buzzword_editor",
+        disabled=[c for c in display_columns if c != "Shortlist"],
         column_config={
+            "Shortlist": st.column_config.CheckboxColumn(
+                "Shortlist", default=False, pinned=True
+            ),
             "Companies House page": st.column_config.LinkColumn(
                 "Companies House page", display_text="Open company page"
             ),
@@ -651,6 +776,16 @@ else:
             ),
         },
     )
+
+    prev = target_buzzword.set_index("Company number")["Shortlist"]
+    curr = edited.set_index("Company number")["Shortlist"]
+    changed = curr.index[prev.ne(curr)]
+    if len(changed) > 0:
+        with get_connection(database_url) as connection:
+            for number in changed:
+                set_user_shortlist(connection, number, user, bool(curr.loc[number]))
+            connection.commit()
+        st.rerun()
 
     st.download_button(
         "Download Target & Buzzword as CSV",
@@ -669,6 +804,73 @@ if restricted.empty:
     st.info("No restricted SIC companies have been received today yet.")
 else:
     restricted = format_age_column(restricted)
+
+    restricted = restricted.copy()
+    restricted["Shortlist"] = False
+
+    with get_connection(database_url) as connection:
+        rows = connection.execute(
+            "SELECT company_number FROM public.user_shortlists WHERE user_name = %s",
+            (user,),
+        ).fetchall()
+    shortlisted_numbers = {r["company_number"] for r in rows}
+    restricted["Shortlist"] = restricted["Company number"].isin(shortlisted_numbers)
+
+    display_columns = [
+        "Shortlist",
+        "Company name",
+        "SIC codes",
+        "Google search",
+        "Companies House page",
+        "Age (mm:ss)",
+    ]
+
+    edited = st.data_editor(
+        restricted[display_columns],
+        use_container_width=True,
+        hide_index=True,
+        key="restricted_editor",
+        disabled=[c for c in display_columns if c != "Shortlist"],
+        column_config={
+            "Shortlist": st.column_config.CheckboxColumn(
+                "Shortlist", default=False, pinned=True
+            ),
+            "Companies House page": st.column_config.LinkColumn(
+                "Companies House page", display_text="Open company page"
+            ),
+            "Google search": st.column_config.LinkColumn(
+                "Google search", display_text="Search Google"
+            ),
+        },
+    )
+
+    prev = restricted.set_index("Company number")["Shortlist"]
+    curr = edited.set_index("Company number")["Shortlist"]
+    changed = curr.index[prev.ne(curr)]
+    if len(changed) > 0:
+        with get_connection(database_url) as connection:
+            for number in changed:
+                set_user_shortlist(connection, number, user, bool(curr.loc[number]))
+            connection.commit()
+        st.rerun()
+
+    st.download_button(
+        "Download Restricted SIC as CSV",
+        data=restricted.to_csv(index=False).encode("utf-8"),
+        file_name="restricted_sic_companies.csv",
+        mime="text/csv",
+        type="primary",
+    )
+
+st.divider()
+
+st.subheader(f"{user}'s shortlist")
+user_short = get_user_shortlist_companies(database_url, user)
+
+if user_short.empty:
+    st.info(f"{user} has not shortlisted any companies today.")
+else:
+    user_short = format_age_column(user_short)
     display_columns = [
         "Company name",
         "SIC codes",
@@ -678,7 +880,7 @@ else:
     ]
 
     st.dataframe(
-        restricted[display_columns],
+        user_short[display_columns],
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -692,9 +894,9 @@ else:
     )
 
     st.download_button(
-        "Download Restricted SIC as CSV",
-        data=restricted.to_csv(index=False).encode("utf-8"),
-        file_name="restricted_sic_companies.csv",
+        f"Download {user}'s shortlist as CSV",
+        data=user_short.to_csv(index=False).encode("utf-8"),
+        file_name=f"{user.lower()}_shortlist.csv",
         mime="text/csv",
         type="primary",
     )
