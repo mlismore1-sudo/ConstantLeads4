@@ -17,7 +17,7 @@ import streamlit as st
 from psycopg.rows import dict_row
 from streamlit_autorefresh import st_autorefresh
 
-APP_VERSION = "2026-08-17-two-dashboards-no-leaderboard-query"
+APP_VERSION = "2026-08-17-two-dashboards-safe-editor"
 STREAM_URL = "https://stream.companieshouse.gov.uk/companies"
 DISPLAY_LIMIT = 250
 REFRESH_INTERVAL_MS = 15000
@@ -745,15 +745,17 @@ else:
         },
     )
 
-    prev = target_buzzword.set_index("Company number")["Shortlist"]
-    curr = edited.set_index("Company number")["Shortlist"]
-    changed = curr.index[prev.ne(curr)]
-    if len(changed) > 0:
-        with get_connection(database_url) as connection:
-            for number in changed:
-                set_user_shortlist(connection, number, user, bool(curr.loc[number]))
-            connection.commit()
-        st.rerun()
+    # Safely detect changes
+    if "Company number" in edited.columns and "Shortlist" in edited.columns:
+        prev = target_buzzword.set_index("Company number")["Shortlist"]
+        curr = edited.set_index("Company number")["Shortlist"]
+        changed = curr.index[prev.ne(curr)]
+        if len(changed) > 0:
+            with get_connection(database_url) as connection:
+                for number in changed:
+                    set_user_shortlist(connection, number, user, bool(curr.loc[number]))
+                connection.commit()
+            st.rerun()
 
     st.download_button(
         "Download Target & Buzzword as CSV",
@@ -812,15 +814,17 @@ else:
         },
     )
 
-    prev = restricted.set_index("Company number")["Shortlist"]
-    curr = edited.set_index("Company number")["Shortlist"]
-    changed = curr.index[prev.ne(curr)]
-    if len(changed) > 0:
-        with get_connection(database_url) as connection:
-            for number in changed:
-                set_user_shortlist(connection, number, user, bool(curr.loc[number]))
-            connection.commit()
-        st.rerun()
+    # Safely detect changes
+    if "Company number" in edited.columns and "Shortlist" in edited.columns:
+        prev = restricted.set_index("Company number")["Shortlist"]
+        curr = edited.set_index("Company number")["Shortlist"]
+        changed = curr.index[prev.ne(curr)]
+        if len(changed) > 0:
+            with get_connection(database_url) as connection:
+                for number in changed:
+                    set_user_shortlist(connection, number, user, bool(curr.loc[number]))
+                connection.commit()
+            st.rerun()
 
     st.download_button(
         "Download Restricted SIC as CSV",
