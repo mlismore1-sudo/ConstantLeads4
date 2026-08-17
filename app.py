@@ -469,7 +469,7 @@ def get_counts(database_url):
             "COUNT(*) FILTER (WHERE source_type = 'restricted_sic') AS restricted, "
             "COUNT(*) AS total "
             "FROM public.screened_companies "
-            "WHERE incorporation_date = (NOW AT TIME ZONE 'Europe/London')::date"
+            "WHERE incorporation_date = (NOW() AT TIME ZONE 'Europe/London')::date"
         ).fetchone()
         status = connection.execute(
             "SELECT MAX(received_at) AS last_received, "
